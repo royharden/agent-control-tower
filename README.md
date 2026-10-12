@@ -64,7 +64,7 @@ flowchart LR
 
 4. **All math in code**: Jev returns probabilities and scores. The threshold comparisons (`blockConfidence`, `criticalRisk`, `autoAllowConfidence`, etc.) all happen in TypeScript, not in the model. This makes the decision auditable, testable, and deterministic.
 
-5. **Mock planner with live Jev**: Even in mock mode (no OpenAI key), Jev still runs live against the TypeSafe API. This lets you demo the safety gate without an LLM planner key while still seeing real calibrated decisions.
+5. **Mock planner with live Jev**: Even in mock mode (no OpenAI key), Jev still runs live against the TypeSafe API. This lets you demo the safety gate without an LLM planner key while still seeing real calibrated decisions. If `TYPESAFE_API_KEY` is unset or the daily demo cap is reached, `jev-check` returns a deterministic scripted verdict instead (`web_search` → allow, `transfer_money`/`delete_file` → block, everything else → ask_human) and the UI shows a banner.
 
 6. **Noul confidence**: Noul answers (reversible, matches_goal) don't have a `confidence` field. We compute `|2p - 1|` in code — a noul of 0.5 (uncertain) gives confidence 0, while 0.0 or 1.0 gives confidence 1.0.
 
@@ -75,7 +75,7 @@ flowchart LR
 ### Prerequisites
 
 - A Supabase project (already provisioned in Bolt)
-- A TypeSafe AI API key (`TYPESAFE_API_KEY`)
+- Optionally a TypeSafe AI API key (`TYPESAFE_API_KEY`) for live Jev checks (scripted demo verdicts are used without it)
 - Optionally an OpenAI API key for the live LLM planner
 
 ### Deploy Edge Functions
@@ -99,7 +99,15 @@ npm run dev
 
 ### Database
 
-The `runs` and `steps` tables are created via Supabase migration with RLS enabled. For this no-auth demo, permissive `anon, authenticated` policies allow the frontend to read/write directly.
+The `runs` and `steps` tables are created via Supabase migration with RLS enabled. The anon key can only **read** them (for run history); all writes go through the `run-log` edge function, which uses the service-role key server-side and whitelists columns, `status`/`decision` values and payload sizes.
+
+### Daily demo cap
+
+Paid upstream calls (OpenAI in `plan`, TypeSafe in `jev-check`) are capped at **200 per UTC day for the whole app**. Each function calls the `increment_usage` Postgres function (service-role only) before every paid fetch — every retry counts. The counter fails closed: if it returns `-1`, `null`, or errors, no paid call is made and the function falls back to the scripted plan / demo verdict with a notice. Counts live in `usage_counters`, which has RLS on and no anon/authenticated access.
+
+### Function auth
+
+All edge functions run with `verify_jwt = true` (see `supabase/config.toml`). The frontend calls them with `supabase.functions.invoke`, which sends the anon key as the bearer token. Functions read their Supabase URL, keys, model names and base URLs from env only, never from the request.
 
 ## Environment Variables
 
@@ -107,10 +115,11 @@ The `runs` and `steps` tables are created via Supabase migration with RLS enable
 |---|---|---|---|
 | `VITE_SUPABASE_URL` | `.env` (client) | Yes | Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | `.env` (client) | Yes | Supabase anon key |
-| `TYPESAFE_API_KEY` | Supabase secrets | Yes | TypeSafe AI API key for Jev |
+| `TYPESAFE_API_KEY` | Supabase secrets | No | TypeSafe AI API key for Jev (scripted demo verdicts without it) |
 | `OPENAI_API_KEY` | Supabase secrets | No | OpenAI key for live planner (mock mode works without it) |
 | `OPENAI_BASE_URL` | Supabase secrets | No | Override OpenAI base URL (default `https://api.openai.com/v1`) |
 | `OPENAI_MODEL` | Supabase secrets | No | Override planner model (default `gpt-4o-mini`) |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Edge function env | Yes | Provided automatically by Supabase to edge functions; used for the usage counter and `run-log` writes |
 
 ## Edge Functions
 
@@ -123,11 +132,21 @@ Calls the TypeSafe API (`POST https://api.typesafe.ai/v1/systemone`) with model 
 - **risk** (score 0-3): How much harm if the call was a mistake?
 - **verdict** (choice): allow / ask_human / block / uncertain
 
-Returns `{answers, model, usage, latency_ms, cost_usd}`. Cost = `input_tokens * 0.042 / 1_000_000` USD. Retries 429/529 with exponential backoff (3 tries).
+Returns `{answers, model, usage, latency_ms, cost_usd, source}`. Cost = `input_tokens * 0.042 / 1_000_000` USD. Retries 429/529 with exponential backoff (3 tries); each attempt counts against the daily cap. Without `TYPESAFE_API_KEY`, or when the cap is reached, returns a scripted verdict with `source: "demo"` and a `notice`. Request sizes are capped (goal 500 chars, tool 64, reason 1000, args 4000 chars of JSON).
 
 ### `plan`
 
-Calls an OpenAI-compatible `/chat/completions` endpoint with JSON output. Returns `{steps: [{tool, args, reason}]}` using only the 6 simulated tools. If no API key is set or mock mode is selected, returns scripted plans for the preset scenarios. **Jev is still called live in mock mode.**
+Calls an OpenAI-compatible `/chat/completions` endpoint with JSON output. Returns `{steps: [{tool, args, reason}]}` using only the 6 simulated tools (at most 6 steps, sizes capped). If mock mode is selected, returns scripted plans for the preset scenarios. If no API key is set or the daily cap is reached, also returns the scripted plan, with a `notice`. **Jev is still called live in mock mode.**
+
+### `run-log`
+
+Persists runs and steps with the service-role key. Actions:
+
+- `create_run` — `{goal, scenario, planner_mode, policy}`
+- `create_step` — `{run_id, idx, tool, args, reason}` (status is always `pending`)
+- `update_step` — `{step_id, updates}` where `updates` may only contain `status`, `decision`, `fired_rules`, `jev_response`, `model`, `latency_ms`, `input_tokens`, `cost_usd`, `tool_result`, `jev_error`
+
+Unknown actions or columns, invalid `status`/`decision` values, and oversized payloads are rejected with 400/413. Writes do not count against the daily AI cap.
 
 ## Mock Tools
 

@@ -6,6 +6,7 @@ import { TraceTimeline } from "@/components/TraceTimeline";
 import { ApprovalQueue } from "@/components/ApprovalQueue";
 import { PolicyPanel } from "@/components/PolicyPanel";
 import { StatsPanel } from "@/components/StatsPanel";
+import { NoticeBanner } from "@/components/NoticeBanner";
 import {
   DEFAULT_POLICY,
   decide,
@@ -71,6 +72,7 @@ function App() {
   const [pastRuns, setPastRuns] = useState<RunRecord[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
+  const [notices, setNotices] = useState<string[]>([]);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const stepsRef = useRef<StepRecord[]>([]);
@@ -108,6 +110,12 @@ function App() {
     })();
   }, []);
 
+  // Server notices (e.g. daily demo limit reached), deduplicated per run.
+  const addNotice = useCallback((notice?: string) => {
+    if (!notice) return;
+    setNotices((prev) => (prev.includes(notice) ? prev : [...prev, notice]));
+  }, []);
+
   const updateStepInState = useCallback(
     (stepId: string, updates: Partial<StepRecord>) => {
       setSteps((prev) =>
@@ -121,6 +129,7 @@ function App() {
     async (goal: string, scenario: Scenario | null) => {
       setIsRunning(true);
       setRunError(null);
+      setNotices([]);
       setSteps([]);
 
       try {
@@ -137,6 +146,7 @@ function App() {
         // 2. Fetch plan
         const useMock = plannerMode === "mock";
         const planResponse = await fetchPlan(goal, useMock);
+        addNotice(planResponse.notice);
 
         // 3. Process each step sequentially
         const newSteps: StepRecord[] = [];
@@ -157,6 +167,7 @@ function App() {
           // 4. Call Jev for this step
           try {
             const jevResp = await callJev(goal, planStep);
+            addNotice(jevResp.notice);
 
             // 5. Apply decision policy
             const { decision, firedRules } = decide(jevResp.answers, policy);
@@ -213,7 +224,7 @@ function App() {
         setIsRunning(false);
       }
     },
-    [plannerMode, policy]
+    [plannerMode, policy, addNotice]
   );
 
   const handleApprove = useCallback(
@@ -251,6 +262,7 @@ function App() {
         setSelectedRunId(runId);
         setCurrentRunId(runId);
         setSteps(runSteps);
+        setNotices([]);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setRunError(msg);
@@ -332,6 +344,8 @@ function App() {
           </div>
         </div>
       )}
+
+      <NoticeBanner notices={notices} />
 
       {/* Main layout: trace + sidebar */}
       <div className="mx-auto max-w-7xl px-6 pb-12">

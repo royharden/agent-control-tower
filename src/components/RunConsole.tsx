@@ -4,6 +4,9 @@ import { SCENARIOS } from "@/lib/scenarios";
 import type { Scenario } from "@/lib/scenarios";
 import type { PlannerMode } from "@/lib/types";
 
+// Matches the server-side cap in the plan / jev-check / run-log functions.
+const MAX_GOAL_CHARS = 500;
+
 interface RunConsoleProps {
   onRun: (goal: string, scenario: Scenario | null) => void;
   isRunning: boolean;
@@ -66,6 +69,7 @@ export function RunConsole({ onRun, isRunning, plannerMode }: RunConsoleProps) {
               }
             }}
             placeholder="Enter a custom goal for the agent…"
+            maxLength={MAX_GOAL_CHARS}
             disabled={isRunning}
             className="flex-1 rounded-xl border border-zinc-700 bg-zinc-950/50 px-4 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-sky-500/50 focus:ring-1 focus:ring-sky-500/30 transition-all disabled:opacity-50"
           />

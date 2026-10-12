@@ -1,3 +1,4 @@
+import { FunctionsHttpError } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
 import type {
   PlanStep,
@@ -9,44 +10,58 @@ import type {
   PlannerMode,
 } from "./types";
 
-const FUNCTION_URL = import.meta.env.VITE_SUPABASE_URL;
-const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const MAX_ERROR_CHARS = 300;
 
+function truncate(text: string): string {
+  return text.length > MAX_ERROR_CHARS ? `${text.slice(0, MAX_ERROR_CHARS)}…` : text;
+}
+
+// Calls an edge function through supabase-js so the anon key is sent as the
+// bearer token (functions verify JWTs), and turns failures into readable errors.
 async function invokeFunction<T>(
   name: string,
-  body: Record<string, unknown>,
-  extraHeaders?: Record<string, string>
+  body: Record<string, unknown>
 ): Promise<T> {
-  const url = `${FUNCTION_URL}/functions/v1/${name}`;
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${ANON_KEY}`,
-    "Content-Type": "application/json",
-    ...extraHeaders,
-  };
+  const { data, error } = await supabase.functions.invoke(name, { body });
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text();
-    let errDetail = errText;
-    try {
-      const errJson = JSON.parse(errText);
-      errDetail = errJson.error || errJson.detail || errText;
-    } catch {
-      // keep raw text
+  if (error) {
+    let detail: string = error.message;
+    let status = "";
+    if (error instanceof FunctionsHttpError) {
+      const resp = error.context as Response;
+      status = ` (${resp.status})`;
+      try {
+        const errText = await resp.text();
+        detail = errText || detail;
+        try {
+          const errJson = JSON.parse(errText);
+          detail = errJson.error || errJson.detail || errJson.message || errText;
+        } catch {
+          // keep raw text
+        }
+      } catch {
+        // keep error.message
+      }
     }
-    throw new Error(`${name} failed (${resp.status}): ${errDetail}`);
+    throw new Error(`${name} failed${status}: ${truncate(String(detail))}`);
   }
 
-  const data = await resp.json();
-  if (data.error) {
-    throw new Error(`${name} error: ${data.error}`);
+  if (data && typeof data === "object" && "error" in data && data.error) {
+    throw new Error(`${name} error: ${truncate(String(data.error))}`);
   }
   return data as T;
+}
+
+async function runLog<T>(
+  body: Record<string, unknown>,
+  failure: string
+): Promise<T> {
+  try {
+    return await invokeFunction<T>("run-log", body);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`${failure}: ${msg}`);
+  }
 }
 
 export async function fetchPlan(
@@ -69,6 +84,7 @@ export async function callJev(
 }
 
 // ---- DB operations ----
+// Writes go through the run-log edge function; reads use the anon key directly.
 
 export async function createRun(
   goal: string,
@@ -76,19 +92,17 @@ export async function createRun(
   plannerMode: PlannerMode,
   policy: Policy
 ): Promise<RunRecord> {
-  const { data, error } = await supabase
-    .from("runs")
-    .insert({
+  const { run } = await runLog<{ run: RunRecord }>(
+    {
+      action: "create_run",
       goal,
       scenario,
       planner_mode: plannerMode,
       policy,
-    })
-    .select()
-    .single();
-
-  if (error) throw new Error(`Failed to create run: ${error.message}`);
-  return data as RunRecord;
+    },
+    "Failed to create run"
+  );
+  return run;
 }
 
 export async function createStep(
@@ -98,32 +112,28 @@ export async function createStep(
   args: Record<string, unknown>,
   reason: string
 ): Promise<StepRecord> {
-  const { data, error } = await supabase
-    .from("steps")
-    .insert({
+  const { step } = await runLog<{ step: StepRecord }>(
+    {
+      action: "create_step",
       run_id: runId,
       idx,
       tool,
       args,
       reason,
-      status: "pending",
-    })
-    .select()
-    .single();
-
-  if (error) throw new Error(`Failed to create step: ${error.message}`);
-  return data as StepRecord;
+    },
+    "Failed to create step"
+  );
+  return step;
 }
 
 export async function updateStep(
   stepId: string,
   updates: Partial<StepRecord>
 ): Promise<void> {
-  const { error } = await supabase
-    .from("steps")
-    .update(updates)
-    .eq("id", stepId);
-  if (error) throw new Error(`Failed to update step: ${error.message}`);
+  await runLog<{ ok: true }>(
+    { action: "update_step", step_id: stepId, updates },
+    "Failed to update step"
+  );
 }
 
 export async function fetchRuns(limit = 20): Promise<RunRecord[]> {

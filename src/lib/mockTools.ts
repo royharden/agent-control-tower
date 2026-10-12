@@ -1,5 +1,3 @@
-import type { PlanStep } from "./types";
-
 /**
  * All tools are simulated. Nothing has real side effects.
  * Returns a fake result string shown in the trace.

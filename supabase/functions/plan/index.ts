@@ -1,12 +1,34 @@
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+// All keys, URLs and model names come from env only — never from the request.
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
 const OPENAI_BASE_URL = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
 const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-6-luna";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+const admin =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      })
+    : null;
+
+const LIMIT_NOTICE = "Daily demo limit reached - showing the scripted demo plan.";
+
+// Request / response size caps
+const MAX_BODY_BYTES = 4 * 1024;
+const MAX_GOAL_CHARS = 500;
+const MAX_PLAN_STEPS = 6;
+const MAX_TOOL_CHARS = 64;
+const MAX_REASON_CHARS = 1000;
+const MAX_ARGS_JSON_CHARS = 4000;
 
 interface PlanStep {
   tool: string;
@@ -14,9 +36,74 @@ interface PlanStep {
   reason: string;
 }
 
-interface PlanRequest {
-  goal: string;
-  use_mock?: boolean;
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// Reads the body as JSON, refusing anything over maxBytes.
+async function readJsonBody(req: Request, maxBytes: number): Promise<unknown> {
+  const tooLarge = () => new HttpError(413, `Request body too large (max ${maxBytes} bytes)`);
+  if (Number(req.headers.get("content-length") ?? "0") > maxBytes) throw tooLarge();
+  if (!req.body) throw new HttpError(400, "Request body is required");
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new HttpError(400, "Request body must be valid JSON");
+  }
+}
+
+// Bumps the app-wide daily counter before a paid upstream call. Fails closed:
+// only a positive count means we are under the cap; -1, null, a non-number or
+// any error means no upstream call may be made.
+async function reserveUpstreamCall(): Promise<boolean> {
+  if (!admin) return false;
+  try {
+    const { data, error } = await admin.rpc("increment_usage", { fn_name: "plan" });
+    if (error) {
+      console.error("increment_usage failed:", error.message);
+      return false;
+    }
+    return typeof data === "number" && Number.isInteger(data) && data > 0;
+  } catch (err) {
+    console.error("increment_usage threw:", err);
+    return false;
+  }
 }
 
 const TOOL_CATALOG = `You have access to exactly these 6 tools:
@@ -142,7 +229,8 @@ Create a plan with 2-4 steps. Be reasonable and safe. Return JSON: {"steps": [{"
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`OpenAI API returned ${resp.status}: ${errText}`);
+    console.error(`OpenAI API returned ${resp.status}: ${errText.slice(0, 500)}`);
+    throw new HttpError(502, `OpenAI API returned ${resp.status}`);
   }
 
   const data = await resp.json();
@@ -150,44 +238,74 @@ Create a plan with 2-4 steps. Be reasonable and safe. Return JSON: {"steps": [{"
   if (!content) throw new Error("No content in OpenAI response");
 
   const parsed = JSON.parse(content);
-  const steps = parsed.steps ?? parsed.plan ?? [];
+  return sanitizePlan(parsed.steps ?? parsed.plan ?? []);
+}
+
+// Keeps only well-formed steps and caps their count and sizes so the plan
+// always fits what jev-check and run-log accept.
+function sanitizePlan(raw: unknown): PlanStep[] {
+  if (!Array.isArray(raw)) return [];
+  const steps: PlanStep[] = [];
+  for (const item of raw.slice(0, MAX_PLAN_STEPS)) {
+    if (!isPlainObject(item)) continue;
+    const { tool, args, reason } = item;
+    if (typeof tool !== "string" || !tool.trim() || tool.length > MAX_TOOL_CHARS) continue;
+    const safeArgs = isPlainObject(args) ? args : {};
+    if (JSON.stringify(safeArgs).length > MAX_ARGS_JSON_CHARS) continue;
+    steps.push({
+      tool: tool.trim(),
+      args: safeArgs,
+      reason: typeof reason === "string" ? reason.slice(0, MAX_REASON_CHARS) : "",
+    });
+  }
   return steps;
+}
+
+function mockPlanFor(goal: string): PlanStep[] {
+  return Object.hasOwn(MOCK_PLANS, goal) ? MOCK_PLANS[goal] : MOCK_PLANS.default;
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
+  if (req.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405);
+  }
 
   try {
-    const { goal, use_mock }: PlanRequest = await req.json();
+    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    if (!isPlainObject(body)) throw new HttpError(400, "Request body must be a JSON object");
 
-    // Use mock if explicitly requested or if no API key
-    if (use_mock || !OPENAI_API_KEY) {
-      const mockPlan = MOCK_PLANS[goal] ?? MOCK_PLANS.default;
-      return new Response(
-        JSON.stringify({ steps: mockPlan, source: "mock" }),
-        {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        }
-      );
+    const { goal, use_mock } = body;
+    if (typeof goal !== "string" || !goal.trim()) {
+      throw new HttpError(400, "goal is required");
+    }
+    if (goal.length > MAX_GOAL_CHARS) {
+      throw new HttpError(400, `goal must be at most ${MAX_GOAL_CHARS} characters`);
+    }
+    if (use_mock !== undefined && typeof use_mock !== "boolean") {
+      throw new HttpError(400, "use_mock must be a boolean");
+    }
+
+    if (use_mock) {
+      return json({ steps: mockPlanFor(goal), source: "mock" });
+    }
+
+    // Only a real OpenAI call counts against the daily cap. No key, cap hit,
+    // or a counter failure all fall back to the scripted plan.
+    if (!OPENAI_API_KEY || !(await reserveUpstreamCall())) {
+      return json({ steps: mockPlanFor(goal), source: "mock", notice: LIMIT_NOTICE });
     }
 
     const steps = await callOpenAI(goal);
-    return new Response(
-      JSON.stringify({ steps, source: "live" }),
-      {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    return json({ steps, source: "live" });
   } catch (err) {
+    if (err instanceof HttpError) {
+      return json({ error: err.message }, err.status);
+    }
+    console.error("plan failed:", err);
     const msg = err instanceof Error ? err.message : String(err);
-    return new Response(
-      JSON.stringify({ error: msg }),
-      {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    return json({ error: msg }, 500);
   }
 });

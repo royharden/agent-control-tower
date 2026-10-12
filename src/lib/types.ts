@@ -46,6 +46,9 @@ export interface JevResponse {
   usage: JevUsage;
   latency_ms: number;
   cost_usd: number;
+  // "demo" = scripted verdict (no key, daily cap reached, or counter failure)
+  source?: "live" | "demo";
+  notice?: string;
 }
 
 export interface JevRequestBody {
@@ -91,6 +94,7 @@ export interface PlanStep {
 export interface PlanResponse {
   steps: PlanStep[];
   source: "live" | "mock";
+  notice?: string;
 }
 
 // ---- Run/Step DB records ----
